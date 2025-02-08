@@ -1,0 +1,9 @@
+json-data/
+xbrl-files/
+old-xbrl-files/
+old-json-data/
+.venv/
+__pycache__/
+
+.env
+*.log
