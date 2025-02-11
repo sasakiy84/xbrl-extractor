@@ -432,6 +432,26 @@ class FinancialStatementConcept:
         return item
 
     @staticmethod
+    def search_unique_concept_by_qname_or_none(
+        concepts: list[ModelConcept], qname: list[str]
+    ) -> ModelConcept | None:
+        """
+        一つしかないと想定している concept を、その qname で検索する
+        """
+        searched_concepts: set[ModelConcept] = set()
+        for concept in concepts:
+            if str(concept.qname) in qname:
+                searched_concepts.add(concept)
+        if len(searched_concepts) == 1:
+            return searched_concepts.pop()
+        elif len(searched_concepts) > 1:
+            raise ValueError(
+                f"Multiple concepts are found. qname: {qname}, searched_concepts: {searched_concepts}"
+            )
+        else:
+            return None
+
+    @staticmethod
     def search_unique_concept_by_label(
         concepts: list[ModelConcept], words_in_label: list[str]
     ) -> ModelConcept | None:
@@ -662,14 +682,12 @@ def get_bs_concepts(model_xbrl: ModelXbrl) -> list[BSConcept]:
 
 
 class PLInstance(BaseModel):
-    # 売上高
-    netSales: AccountingItem
-    # 売上原価
-    costOfSales: AccountingItem
-    # 販売費および一般管理費
-    generalAndAdministrativeExpenses: AccountingItem
-    # 営業利益又は営業損失
-    operatingRevenue: AccountingItem
+    # 営業利益
+    operatingIncome: AccountingItem
+    # 売上高（営業利益に対してプラスとするもの）
+    netSales: list[AccountingItem]
+    # 費用（営業利益に対してマイナスとするもの）
+    expenses: list[AccountingItem]
     # 元の木構造をそのまま保持した、当期損益
     profitAndLoss: AccountingItem
     consolidated: bool
@@ -691,12 +709,38 @@ class PLConcept(FinancialStatementConcept):
         super().__init__(
             root_concepts, role_type, summation_item, account_standard, consolidated
         )
+
+        pl_root_qnames = [
+            "jppfs_cor:ProfitLoss",
+            "jpigp_cor:ProfitLossIFRS",
+        ]
+        # root_concepts は一つを想定するが、一つとは限らない
         # 営業収益 / Operating revenue (jppfs_cor_OperatingRevenue1) が紛れることがある（cf. 高島屋157期（2022-2023））
-        pl_root_concept = self.search_unique_concept_by_label(
-            self.root_concepts, ["当期利益", "Profit", "当期純利益"]
+        pl_root_concept = self.search_unique_concept_by_qname_or_none(
+            root_concepts, pl_root_qnames
         )
         if pl_root_concept is None:
-            raise ValueError("Profit and loss root concept should be found.")
+            # 一つも見つからない場合は、一つ下の階層を探す
+            # たとえば、株式会社大盛工業の57期第2四半期決算は root_concept が包括利益（jppfs_cor:ComprehensiveIncome）で
+            # その一つ下の階層に当期損益（jppfs_cor:ProfitLoss）がある
+            root_child_concepts: list[ModelConcept] = []
+            for root_concept in root_concepts:
+                root_child_concepts_and_relationship = self._get_child_concepts(
+                    root_concept
+                )
+                for root_child_concept, _ in root_child_concepts_and_relationship:
+                    root_child_concepts.append(root_child_concept)
+            pl_root_concept = self.search_unique_concept_by_qname_or_none(
+                root_child_concepts, pl_root_qnames
+            )
+
+        # for root_concept in root_concepts:
+        #     print(_to_str_recursively(root_concept, role_type, summation_item))
+
+        if pl_root_concept is None:
+            raise ValueError(
+                f"Profit and loss root concept should be found, root_concepts: {root_concepts}"
+            )
         self.pl_root_concept = pl_root_concept
 
     def _is_decendant_items_weight_all_one(self, current_item: AccountingItem) -> bool:
@@ -714,36 +758,124 @@ class PLConcept(FinancialStatementConcept):
         else:
             return False
 
-    def _has_qname_item_in_descendants(
-        self, current_item: AccountingItem, qname: str
+    def _is_decendant_items_balance_all_same(
+        self, balance: Literal["debit", "credit"], current_item: AccountingItem
     ) -> bool:
         """
-        items を再帰的に深さ優先で調べて、qname が一致する AccountingItem があるかどうかを返す
+        自身とその子孫を再帰的に深さ優先で調べて、全ての items の balance が balance であるかどうかを返す
+        本来ならメモ化再帰で実装するべきだが、items の数が多くないので、単純な再帰で実装
         """
-        if current_item.qname == qname:
-            return True
-        for item in current_item.items:
-            if self._has_qname_item_in_descendants(item, qname):
-                return True
-        return False
+        if current_item.balance != balance:
+            return False
+        return all(
+            self._is_decendant_items_balance_all_same(balance, item)
+            for item in current_item.items
+        )
 
-    def _extract_net_sales(
-        self, current_item: AccountingItem, result_list: list[AccountingItem]
-    ) -> list[AccountingItem] | None:
+    def _get_qname_item_recursively(
+        self, current_item: AccountingItem, qname: list[str]
+    ) -> AccountingItem | None:
         """
-        売上高を取得する。
-        items を再帰的に深さ優先で調べて、現在の items の weight が全て 1 である AccountingItem を返す。
-        そのとき、親の参照も返す
+        items を再帰的に深さ優先で調べて、qname のいずれかが一致する AccountingItem を返す
         """
-        result_list.append(current_item)
-        if self._is_decendant_items_weight_all_one(current_item):
-            return result_list
-        else:
-            for child_item in current_item.items:
-                if child_item.weight_in_parent == 1:
-                    return self._extract_net_sales(child_item, result_list)
+        if current_item.qname in qname:
+            return current_item
+        for item in current_item.items:
+            result = self._get_qname_item_recursively(item, qname)
+            if result is not None:
+                return result
+
+    def _extract_operating_income(
+        self, parent_item: AccountingItem
+    ) -> AccountingItem | None:
+        """
+        parent_item を再帰的に辿って、営業利益を取得する
+        """
+        operating_income_qnames = [
+            "jppfs_cor:OperatingIncome",
+            "jpigp_cor:OperatingProfitLossIFRS",
+        ]
+
+        operating_income_item = self._get_qname_item_recursively(
+            parent_item, operating_income_qnames
+        )
+
+        if operating_income_item is not None:
+            return operating_income_item
+
+        # 銀行の場合を考慮
+        # 銀行の場合は営業利益という概念が慣例的になく、経常利益（OrdinaryIncome）を営業利益として扱う
+        operating_income_bnk_item = self._extract_ordinaly_income_bnk(parent_item)
+        if operating_income_bnk_item is not None:
+            return operating_income_bnk_item
 
         return None
+
+    def _extract_ordinaly_income_bnk(
+        self, parent_item: AccountingItem
+    ) -> AccountingItem | None:
+        """
+        銀行の場合は営業利益という概念が慣例的にない
+        [やさしい銀行の読み方 全国銀行協会](https://www.zenginkyo.or.jp/fileadmin/res/abstract/efforts/smooth/accounting/disclosure.pdf#page=18)
+        そのため、子孫に jppfs_cor:OrdinaryIncomeBNK があれば、jppfs_cor:OrdinaryIncome を営業利益として扱う
+        """
+        operating_income_qnames = [
+            "jppfs_cor:OrdinaryIncome",
+        ]
+        operating_income_item = self._get_qname_item_recursively(
+            parent_item, operating_income_qnames
+        )
+
+        if operating_income_item is None:
+            return None
+
+        # 子孫に jppfs_cor:OrdinaryIncomeBNK などの銀行を示す項目がない場合は、営業利益として扱うことはできない
+        operating_income_bnk_qnames = [
+            "jppfs_cor:OrdinaryIncomeBNK",
+            "jppfs_cor:OrdinaryExpensesBNK",
+        ]
+        operating_income_bnk_item = self._get_qname_item_recursively(
+            operating_income_item, operating_income_bnk_qnames
+        )
+
+        if operating_income_bnk_item is None:
+            return None
+
+        return operating_income_item
+
+    def _extract_expenses_and_net_sales(
+        self, operating_income: AccountingItem
+    ) -> tuple[list[AccountingItem], list[AccountingItem]]:
+        """
+        operating_income を再帰的に辿って、費用と売上高を取得する
+        expenses は、自身と子孫の balance が debit のもの
+        net_sales は、自身と子孫の balance が credit のもの
+
+        Returns:
+            tuple[list[AccountingItem], list[AccountingItem]]: first item is expenses, second item is net sales
+        """
+
+        def extract_expenses_and_net_sales_recursively(
+            current_item: AccountingItem,
+            expenses: list[AccountingItem],
+            net_sales: list[AccountingItem],
+        ) -> tuple[list[AccountingItem], list[AccountingItem]]:
+            if self._is_decendant_items_balance_all_same("debit", current_item):
+                expenses.append(current_item)
+                return expenses, net_sales
+            elif self._is_decendant_items_balance_all_same("credit", current_item):
+                net_sales.append(current_item)
+                return expenses, net_sales
+            for item in current_item.items:
+                expenses, net_sales = extract_expenses_and_net_sales_recursively(
+                    item, expenses, net_sales
+                )
+            return expenses, net_sales
+
+        expenses, net_sales = extract_expenses_and_net_sales_recursively(
+            operating_income, [], []
+        )
+        return expenses, net_sales
 
     def extract_instances(self) -> list[PLInstance]:
         """
@@ -752,49 +884,30 @@ class PLConcept(FinancialStatementConcept):
         instances: list[PLInstance] = []
 
         for context in self.contexts:
-            profit_and_loss_item = self._extract_items(self.pl_root_concept, context)
-            if profit_and_loss_item is None:
-                raise ValueError(
-                    f"Profit and loss item should not be None. context: {context}"
-                )
-
             pl_root_fact = self._get_unique_fact_by_concept_and_context(
                 self.pl_root_concept, context
             )
-            route_to_net_sales_item = self._extract_net_sales(profit_and_loss_item, [])
-            if route_to_net_sales_item is None:
+            profit_and_loss_item = self._extract_items(self.pl_root_concept, context)
+            if profit_and_loss_item is None:
                 raise ValueError(
-                    f"Net sales item should not be None. context: {context}"
+                    f"Profit and loss item should not be None. context: {context}, pl_root_concept: {self.pl_root_concept}"
                 )
-            if len(route_to_net_sales_item) < 3:
-                print(
-                    f"[WARNING] Route to net sales item should be longer than 3, but got {len(route_to_net_sales_item)}, {[item.name for item in route_to_net_sales_item]}"
-                )
-                continue
 
-            net_sales_item = route_to_net_sales_item[-1]
-            # 三菱ケミカルグループ株式会社第19期有価証券報告書のように、売上高の概念がない場合がある
-            if len(route_to_net_sales_item[-2].items) != 2:
-                print(
-                    f"[WARNING] Only 2 items should be in the parent of net sales item, but got {len(route_to_net_sales_item[-2].items)}, {[item.name for item in route_to_net_sales_item[-2].items]}"
+            # 営業利益を起点とする
+            operating_income_item = self._extract_operating_income(profit_and_loss_item)
+            if operating_income_item is None:
+                raise ValueError(
+                    f"Operating income item should not be None. context: {context}, pl_root_concept: {self.pl_root_concept}"
                 )
-                continue
-            cost_of_sales_item = route_to_net_sales_item[-2].items[1]
-            if len(route_to_net_sales_item[-3].items) != 2:
-                print(
-                    f"[WARNING] Only 2 items should be in the parent of cost of sales item, but got {len(route_to_net_sales_item[-3].items)}, {[item.name for item in route_to_net_sales_item[-3].items]}"
-                )
-                continue
-            general_and_administrative_expenses_item = route_to_net_sales_item[
-                -3
-            ].items[1]
-            operating_revenue_item = route_to_net_sales_item[-3]
+
+            expenses, net_sales = self._extract_expenses_and_net_sales(
+                operating_income_item
+            )
 
             instance = PLInstance(
-                netSales=net_sales_item,
-                costOfSales=cost_of_sales_item,
-                generalAndAdministrativeExpenses=general_and_administrative_expenses_item,
-                operatingRevenue=operating_revenue_item,
+                operatingIncome=operating_income_item,
+                expenses=expenses,
+                netSales=net_sales,
                 profitAndLoss=profit_and_loss_item,
                 consolidated=self.consolidated,
                 durationFrom=context.startDatetime,
@@ -972,34 +1085,30 @@ class CFConcept(FinancialStatementConcept):
         )
 
         for context in self.contexts:
-            operating_item = (
-                self._extract_items(self.root_operating_concept, context)
-                if self.root_operating_concept is not None
-                else placeholder_accounting_item
-            )
-            investing_item = (
-                self._extract_items(self.root_investing_concept, context)
-                if self.root_investing_concept is not None
-                else placeholder_accounting_item
-            )
-            financing_item = (
-                self._extract_items(self.root_financing_concept, context)
-                if self.root_financing_concept is not None
-                else placeholder_accounting_item
-            )
-
+            # 対応する concept がない場合や、対応する concept があっても対応する fact がない場合は、placeholder_accounting_item を使う
+            operating_item = None
+            if self.root_operating_concept is not None:
+                operating_item = self._extract_items(
+                    self.root_operating_concept, context
+                )
             if operating_item is None:
-                raise ValueError(
-                    f"Operating item should not be None. context: {context}"
+                operating_item = placeholder_accounting_item
+
+            investing_item = None
+            if self.root_investing_concept is not None:
+                investing_item = self._extract_items(
+                    self.root_investing_concept, context
                 )
             if investing_item is None:
-                raise ValueError(
-                    f"Investing item should not be None. context: {context}"
+                investing_item = placeholder_accounting_item
+
+            financing_item = None
+            if self.root_financing_concept is not None:
+                financing_item = self._extract_items(
+                    self.root_financing_concept, context
                 )
             if financing_item is None:
-                raise ValueError(
-                    f"Financing item should not be None. context: {context}"
-                )
+                financing_item = placeholder_accounting_item
 
             operating_root_fact = self._get_unique_fact_by_concept_and_context(
                 self.root_operating_concept, context
