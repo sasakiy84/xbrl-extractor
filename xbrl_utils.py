@@ -2,7 +2,7 @@ from abc import abstractmethod
 from datetime import datetime
 from itertools import combinations, product
 from pathlib import Path
-from typing import Literal, Self, TypeVar
+from typing import Literal, Optional, Self, TypeVar
 from zipfile import ZipFile
 from arelle import Cntlr, FileSource
 from arelle.ModelXbrl import ModelXbrl, ModelFact, ModelContext
@@ -10,6 +10,11 @@ from arelle.ModelDtsObject import ModelConcept, ModelRelationship
 from arelle import XbrlConst
 from arelle.ModelRelationshipSet import ModelRelationshipSet
 from pydantic import BaseModel
+import logging
+
+LOGGER_NAME = "xbrl_utils"
+
+logger = logging.getLogger(LOGGER_NAME)
 
 
 def load_edinet_xbrl_model_from_zip(
@@ -42,11 +47,11 @@ def load_edinet_xbrl_models_from_zip(
     entry_point = entry_points_canditates[0]
     target_file_with_entry_point = zip_file_path / entry_point
 
-    xbrls, cntlr = load_ebrls_with_arelle(target_file_with_entry_point)
+    xbrls, cntlr = load_xbrls_with_arelle(target_file_with_entry_point)
     return xbrls, cntlr
 
 
-def load_ebrls_with_arelle(xbrl_file_path: Path) -> tuple[list[ModelXbrl], Cntlr.Cntlr]:
+def load_xbrls_with_arelle(xbrl_file_path: Path) -> tuple[list[ModelXbrl], Cntlr.Cntlr]:
     cntlr = Cntlr.Cntlr(logFileName="logToPrint")
     cntlr.startLogging()
     target_file = FileSource.openFileSource(str(xbrl_file_path))
@@ -54,6 +59,32 @@ def load_ebrls_with_arelle(xbrl_file_path: Path) -> tuple[list[ModelXbrl], Cntlr
 
     loaded_model_xbrls: list[ModelXbrl] = cntlr.modelManager.loadedModelXbrls
     return loaded_model_xbrls, cntlr
+
+
+def get_formatted_fiscal_year(xbrl_model: ModelXbrl) -> str | None:
+    TERM_KEYS = [
+        "FiscalYearCoverPage",
+        "SemiAnnualAccountingPeriodCoverPage",
+        "QuarterlyAccountingPeriodCoverPage",
+        "AccountingPeriodCoverPage",
+        "SemiAnnualAccountingPeriodCoverPage",
+        "QuarterlyAccountingPeriodCoverPage",
+    ]
+    fiscal_year_set: set[ModelFact] = set()
+    for term_key in TERM_KEYS:
+        fiscal_year_set |= xbrl_model.factsByLocalName[term_key]
+    if len(fiscal_year_set) == 0:
+        return None
+    elif len(fiscal_year_set) > 1:
+        fiscal_year = list(fiscal_year_set)[0].value
+        logger.warning(
+            f"Multiple fiscal year values found: {fiscal_year_set}. Using {fiscal_year}"
+        )
+    else:
+        fiscal_year = list(fiscal_year_set)[0].value
+
+    formatted = fiscal_year.split("（")[0]
+    return formatted
 
 
 # 以下の「02 . 財務諸表本表」、「03 . 国際会計基準」から
@@ -272,11 +303,11 @@ def get_context_used_in_concept(
 
 class AccountingItem(BaseModel):
     name: str
-    nameJa: str | None
-    nameEn: str | None
+    nameJa: Optional[str]
+    nameEn: Optional[str]
     nameDetail: str
-    nameDetailJa: str | None
-    nameDetailEn: str | None
+    nameDetailJa: Optional[str]
+    nameDetailEn: Optional[str]
     value: float
     items: list[Self]
     qname: str
@@ -295,12 +326,18 @@ class FinancialStatementConcept:
         summation_item: str,
         account_standard: str,
         consolidated: bool,
+        docId: str,
+        docType: Literal["Annual", "SemiAnnual", "Quarterly"],
+        docSubmissionDate: datetime,
     ) -> Self:
         self.root_concepts = root_concepts
         self.role_type = role_type
         self.summation_item = summation_item
         self.account_standard = account_standard
         self.consolidated = consolidated
+        self.docId = docId
+        self.docType = docType
+        self.docSubmissionDate = docSubmissionDate
         self.contexts: list[ModelContext] = []
 
         if len(root_concepts) == 0:
@@ -349,13 +386,15 @@ class FinancialStatementConcept:
 
     def _get_unique_fact_by_concept_and_context(
         self, concept: ModelConcept, context: ModelContext
-    ) -> ModelFact:
+    ) -> Optional[ModelFact]:
         facts = self.xbrl_model.factsByQname[concept.qname]
         facts: list[ModelFact] = list(
             filter(lambda fact: fact.context == context, facts)
         )
         if len(facts) == 1:
             return facts[0]
+        elif len(facts) == 0:
+            return None
         else:
             for fact_a, fact_b in combinations(facts, 2):
                 if fact_a.sValue != fact_b.sValue:
@@ -395,6 +434,8 @@ class FinancialStatementConcept:
         parent_fact = self._get_unique_fact_by_concept_and_context(
             parent_concept, context
         )
+        if parent_fact is None:
+            return None
         if parent_fact.isNil:
             return None
         nameJa = parent_fact.concept.label(lang="ja")
@@ -452,6 +493,26 @@ class FinancialStatementConcept:
             return None
 
     @staticmethod
+    def search_unique_concept_by_local_name(
+        concepts: list[ModelConcept], local_name: list[str]
+    ) -> Optional[ModelConcept]:
+        """
+        一つしかないと想定している concept を、その local_name で検索する
+        """
+        searched_concepts: set[ModelConcept] = set()
+        for concept in concepts:
+            if concept.qname.localName in local_name:
+                searched_concepts.add(concept)
+        if len(searched_concepts) == 1:
+            return searched_concepts.pop()
+        elif len(searched_concepts) > 1:
+            raise ValueError(
+                f"Multiple concepts are found. local_name: {local_name}, searched_concepts: {searched_concepts}"
+            )
+        else:
+            return None
+
+    @staticmethod
     def search_unique_concept_by_label(
         concepts: list[ModelConcept], words_in_label: list[str]
     ) -> ModelConcept | None:
@@ -480,6 +541,7 @@ class FinancialStatementConcept:
 
 
 class BSInstance(BaseModel):
+    accountStandard: str
     assets: AccountingItem
     liabilities: AccountingItem
     net_assets: AccountingItem
@@ -487,6 +549,9 @@ class BSInstance(BaseModel):
     period: datetime
     unit: str
     roleType: str
+    docId: str
+    docType: Literal["Annual", "SemiAnnual", "Quarterly"]
+    docSubmissionDate: datetime
 
 
 class BSConcept(FinancialStatementConcept):
@@ -497,15 +562,27 @@ class BSConcept(FinancialStatementConcept):
         summation_item: str,
         account_standard: str,
         consolidated: bool,
+        doc_id: str,
+        doc_type: Literal["Annual", "SemiAnnual", "Quarterly"],
+        doc_submission_date: datetime,
     ):
         super().__init__(
-            root_concepts, role_type, summation_item, account_standard, consolidated
+            root_concepts,
+            role_type,
+            summation_item,
+            account_standard,
+            consolidated,
+            doc_id,
+            doc_type,
+            doc_submission_date,
         )
 
         root_debit_concept: ModelConcept | None = None
         root_credit_concept: ModelConcept | None = None
         if len(root_concepts) != 2:
-            raise ValueError("Root concept should have 2 concepts.")
+            raise ValueError(
+                f"Root concept should have 2 concepts, root_concepts: {root_concepts}"
+            )
         for root_concept in root_concepts:
             if root_concept.balance == "debit":
                 root_debit_concept = root_concept
@@ -543,6 +620,10 @@ class BSConcept(FinancialStatementConcept):
             debit_root_fact = self._get_unique_fact_by_concept_and_context(
                 self.root_debit_concept, context
             )
+            if debit_root_fact is None:
+                raise ValueError(
+                    f"Debit root fact is not found. context: {context}, concept: {self.root_debit_concept}"
+                )
             if len(credit_item.items) != 2:
                 raise ValueError(
                     f"Credit item should have 2 items. credit_item: {credit_item}"
@@ -553,13 +634,17 @@ class BSConcept(FinancialStatementConcept):
             net_assets = credit_item.items[1]
 
             instance = BSInstance(
+                accountStandard=self.account_standard,
                 assets=assets,
                 liabilities=liabilities,
                 net_assets=net_assets,
                 consolidated=self.consolidated,
-                period=context.instantDatetime,
+                period=context.period,
                 unit=debit_root_fact.unitID,
                 roleType=self.role_type,
+                docId=self.docId,
+                docType=self.docType,
+                docSubmissionDate=self.docSubmissionDate,
             )
             instances.append(instance)
 
@@ -608,7 +693,12 @@ def _get_financial_statement_concepts(
     return concepts
 
 
-def _get_bs_jp_concepts(model_xbrl: ModelXbrl) -> list[BSConcept]:
+def _get_bs_jp_concepts(
+    model_xbrl: ModelXbrl,
+    doc_id: str,
+    doc_type: Literal["Annual", "Quarterly", "SemiAnnual"],
+    doc_submission_date: datetime,
+) -> list[BSConcept]:
     """
     JP GAAP の非連結貸借対照表のConceptを取得する
     """
@@ -616,25 +706,51 @@ def _get_bs_jp_concepts(model_xbrl: ModelXbrl) -> list[BSConcept]:
     bs_concepts: list[BSConcept] = []
     for root_concepts, role_type, summation_item in bs_jp_concepts:
         bs_concept = BSConcept(
-            root_concepts, role_type, summation_item, "JP GAAP", False
+            root_concepts,
+            role_type,
+            summation_item,
+            "JP GAAP",
+            False,
+            doc_id=doc_id,
+            doc_type=doc_type,
+            doc_submission_date=doc_submission_date,
         )
         bs_concepts.append(bs_concept)
     return bs_concepts
 
 
-def _get_bs_ifrs_concepts(model_xbrl: ModelXbrl) -> list[BSConcept]:
+def _get_bs_ifrs_concepts(
+    model_xbrl: ModelXbrl,
+    doc_id: str,
+    doc_type: Literal["Annual", "Quarterly", "SemiAnnual"],
+    doc_submission_date: datetime,
+) -> list[BSConcept]:
     """
     IFRS の非連結貸借対照表のConceptを取得する
     """
     bs_ifrs_concepts = _get_financial_statement_concepts(model_xbrl, BS_ROLE_TYPE_IFRS)
     bs_concepts: list[BSConcept] = []
     for root_concepts, role_type, summation_item in bs_ifrs_concepts:
-        bs_concept = BSConcept(root_concepts, role_type, summation_item, "IFRS", False)
+        bs_concept = BSConcept(
+            root_concepts,
+            role_type,
+            summation_item,
+            "IFRS",
+            False,
+            doc_id=doc_id,
+            doc_type=doc_type,
+            doc_submission_date=doc_submission_date,
+        )
         bs_concepts.append(bs_concept)
     return bs_concepts
 
 
-def _get_bs_consolidated_jp_concepts(model_xbrl: ModelXbrl) -> list[BSConcept]:
+def _get_bs_consolidated_jp_concepts(
+    model_xbrl: ModelXbrl,
+    doc_id: str,
+    doc_type: Literal["Annual", "Quarterly", "SemiAnnual"],
+    doc_submission_date: datetime,
+) -> list[BSConcept]:
     """
     JP GAAP の連結貸借対照表のConceptを取得する
     """
@@ -644,13 +760,25 @@ def _get_bs_consolidated_jp_concepts(model_xbrl: ModelXbrl) -> list[BSConcept]:
     bs_concepts: list[BSConcept] = []
     for root_concepts, role_type, summation_item in bs_consolidated_jp_concepts:
         bs_concept = BSConcept(
-            root_concepts, role_type, summation_item, "JP GAAP", True
+            root_concepts,
+            role_type,
+            summation_item,
+            "JP GAAP",
+            True,
+            doc_id=doc_id,
+            doc_type=doc_type,
+            doc_submission_date=doc_submission_date,
         )
         bs_concepts.append(bs_concept)
     return bs_concepts
 
 
-def _get_bs_consolidated_ifrs_concepts(model_xbrl: ModelXbrl) -> list[BSConcept]:
+def _get_bs_consolidated_ifrs_concepts(
+    model_xbrl: ModelXbrl,
+    doc_id: str,
+    doc_type: Literal["Annual", "Quarterly", "SemiAnnual"],
+    doc_submission_date: datetime,
+) -> list[BSConcept]:
     """
     IFRS の連結貸借対照表のConceptを取得する
     """
@@ -659,19 +787,39 @@ def _get_bs_consolidated_ifrs_concepts(model_xbrl: ModelXbrl) -> list[BSConcept]
     )
     bs_concepts: list[BSConcept] = []
     for root_concepts, role_type, summation_item in bs_consolidated_ifrs_concepts:
-        bs_concept = BSConcept(root_concepts, role_type, summation_item, "IFRS", True)
+        bs_concept = BSConcept(
+            root_concepts,
+            role_type,
+            summation_item,
+            "IFRS",
+            True,
+            doc_id=doc_id,
+            doc_type=doc_type,
+            doc_submission_date=doc_submission_date,
+        )
         bs_concepts.append(bs_concept)
     return bs_concepts
 
 
-def get_bs_concepts(model_xbrl: ModelXbrl) -> list[BSConcept]:
+def get_bs_concepts(
+    model_xbrl: ModelXbrl, doc_id: str, doc_type: str, doc_submission_date: datetime
+) -> list[BSConcept]:
     """
     貸借対照表のConceptを取得する
     """
-    bs_jp_concepts = _get_bs_jp_concepts(model_xbrl)
-    bs_ifrs_concepts = _get_bs_ifrs_concepts(model_xbrl)
-    bs_consolidated_jp_concepts = _get_bs_consolidated_jp_concepts(model_xbrl)
-    bs_consolidated_ifrs_concepts = _get_bs_consolidated_ifrs_concepts(model_xbrl)
+    logger.debug("Get BS concepts")
+    bs_jp_concepts = _get_bs_jp_concepts(
+        model_xbrl, doc_id, doc_type, doc_submission_date
+    )
+    bs_ifrs_concepts = _get_bs_ifrs_concepts(
+        model_xbrl, doc_id, doc_type, doc_submission_date
+    )
+    bs_consolidated_jp_concepts = _get_bs_consolidated_jp_concepts(
+        model_xbrl, doc_id, doc_type, doc_submission_date
+    )
+    bs_consolidated_ifrs_concepts = _get_bs_consolidated_ifrs_concepts(
+        model_xbrl, doc_id, doc_type, doc_submission_date
+    )
     bs_concepts = (
         bs_jp_concepts
         + bs_ifrs_concepts
@@ -682,6 +830,7 @@ def get_bs_concepts(model_xbrl: ModelXbrl) -> list[BSConcept]:
 
 
 class PLInstance(BaseModel):
+    accountStandard: str
     # 営業利益
     operatingIncome: AccountingItem
     # 売上高（営業利益に対してプラスとするもの）
@@ -695,6 +844,9 @@ class PLInstance(BaseModel):
     durationTo: datetime
     unit: str
     roleType: str
+    docId: str
+    docType: Literal["Annual", "Quarterly", "SemiAnnual"]
+    docSubmissionDate: datetime
 
 
 class PLConcept(FinancialStatementConcept):
@@ -705,17 +857,38 @@ class PLConcept(FinancialStatementConcept):
         summation_item: str,
         account_standard: str,
         consolidated: bool,
+        doc_id: str,
+        doc_type: Literal["Annual", "SemiAnnual", "Quarterly"],
+        doc_submission_date: datetime,
     ):
         super().__init__(
-            root_concepts, role_type, summation_item, account_standard, consolidated
+            root_concepts,
+            role_type,
+            summation_item,
+            account_standard,
+            consolidated,
+            doc_id,
+            doc_type,
+            doc_submission_date,
         )
 
         pl_root_qnames = [
             "jppfs_cor:ProfitLoss",
             "jpigp_cor:ProfitLossIFRS",
+            # 子会社の売却などにより、継続事業と非継続事業を分けるときがある
+            # たとえば、株式会社マクロミルの第10期有価証券報告書では
+            # 連結の root_concept が継続事業からの当期利益（△損失）（IFRS）だった
+            # なお、同報告書の非継続事業はトップダウンではとれなかった
+            # JP GAAP にはこれに相当する項目がなさそう
+            "jpigp_cor:ProfitLossFromContinuingOperationsIFRS",  # 継続事業からの当期利益（△損失）（IFRS）
+            # 直接税引前利益が配置されている場合もある（cf. 株式会社テンポスホールディングス）
+            # 営業利益がとれればいいので、qname に追加してしまうことにした
+            "jppfs_cor:IncomeBeforeIncomeTaxes",  # 税引前当期純利益又は税引前当期純損失（△）
+            # cf. 山洋電気株式会社第121期第１四半期(自 2022年４月１日 至 2022年６月30日)四半期報告書
+            "jpigp_cor:ProfitLossBeforeTaxIFRS",
         ]
         # root_concepts は一つを想定するが、一つとは限らない
-        # 営業収益 / Operating revenue (jppfs_cor_OperatingRevenue1) が紛れることがある（cf. 高島屋157期（2022-2023））
+        # たとえば、営業収益 / Operating revenue (jppfs_cor_OperatingRevenue1) が紛れることがある（cf. 高島屋157期（2022-2023））
         pl_root_concept = self.search_unique_concept_by_qname_or_none(
             root_concepts, pl_root_qnames
         )
@@ -734,8 +907,11 @@ class PLConcept(FinancialStatementConcept):
                 root_child_concepts, pl_root_qnames
             )
 
-        # for root_concept in root_concepts:
-        #     print(_to_str_recursively(root_concept, role_type, summation_item))
+        # 見つからない場合は、localName で探す
+        if pl_root_concept is None:
+            pl_root_concept = self.search_unique_concept_by_local_name(
+                root_concepts, ["NetIncomeLossPL", "ProfitLossIFRS", "ProfitLoss"]
+            )
 
         if pl_root_concept is None:
             raise ValueError(
@@ -774,7 +950,7 @@ class PLConcept(FinancialStatementConcept):
 
     def _get_qname_item_recursively(
         self, current_item: AccountingItem, qname: list[str]
-    ) -> AccountingItem | None:
+    ) -> Optional[AccountingItem]:
         """
         items を再帰的に深さ優先で調べて、qname のいずれかが一致する AccountingItem を返す
         """
@@ -787,13 +963,19 @@ class PLConcept(FinancialStatementConcept):
 
     def _extract_operating_income(
         self, parent_item: AccountingItem
-    ) -> AccountingItem | None:
+    ) -> Optional[AccountingItem]:
         """
         parent_item を再帰的に辿って、営業利益を取得する
         """
         operating_income_qnames = [
             "jppfs_cor:OperatingIncome",
+            "jpigp_cor:OperatingIncomeIFRS",
+            # 多分これは違う？
+            # "jppfs_cor:ProfitLoss",
+            # "gpigp_cor:ProfitLossIFRS",
             "jpigp_cor:OperatingProfitLossIFRS",
+            # 鉄道会社で利用されている項目（cf. 京王電鉄株式会社の第102期有価証券報告書）
+            "jppfs_cor:OperatingIncomeTotalBusiness",  # 事業営業利益又は全事業営業損失
         ]
 
         operating_income_item = self._get_qname_item_recursively(
@@ -803,17 +985,31 @@ class PLConcept(FinancialStatementConcept):
         if operating_income_item is not None:
             return operating_income_item
 
-        # 銀行の場合を考慮
-        # 銀行の場合は営業利益という概念が慣例的になく、経常利益（OrdinaryIncome）を営業利益として扱う
-        operating_income_bnk_item = self._extract_ordinaly_income_bnk(parent_item)
-        if operating_income_bnk_item is not None:
-            return operating_income_bnk_item
+        # 銀行や保険業の場合を考慮
+        # たとえば、銀行の場合は営業利益という概念が慣例的になく、経常利益（OrdinaryIncome）を営業利益として扱う
+        operating_income_item_in_specific_domain = (
+            self._extract_ordinaly_income_in_specific_domain(parent_item)
+        )
+        if operating_income_item_in_specific_domain is not None:
+            return operating_income_item_in_specific_domain
+
+        # ここまできて営業利益がないときは、個別対応
+        # jpigp_cor:Revenue2IFRS があればそれを使う
+        special_operating_income_qnames = [
+            # 株式会社クレディセゾン第74期（自 2023年４月１日 至 2024年３月31日）有価証券報告書
+            "jpigp_cor:Revenue2IFRS",  # 収益（IFRS）
+        ]
+        special_operating_income_item = self._get_qname_item_recursively(
+            parent_item, special_operating_income_qnames
+        )
+        if special_operating_income_item is not None:
+            return special_operating_income_item
 
         return None
 
-    def _extract_ordinaly_income_bnk(
+    def _extract_ordinaly_income_in_specific_domain(
         self, parent_item: AccountingItem
-    ) -> AccountingItem | None:
+    ) -> Optional[AccountingItem]:
         """
         銀行の場合は営業利益という概念が慣例的にない
         [やさしい銀行の読み方 全国銀行協会](https://www.zenginkyo.or.jp/fileadmin/res/abstract/efforts/smooth/accounting/disclosure.pdf#page=18)
@@ -829,13 +1025,17 @@ class PLConcept(FinancialStatementConcept):
         if operating_income_item is None:
             return None
 
-        # 子孫に jppfs_cor:OrdinaryIncomeBNK などの銀行を示す項目がない場合は、営業利益として扱うことはできない
-        operating_income_bnk_qnames = [
+        # 子孫に特定の業界を示す項目がない場合は、営業利益として扱うことはできない
+        operating_income_in_specific_domain_qname = [
+            # 銀行業
             "jppfs_cor:OrdinaryIncomeBNK",
             "jppfs_cor:OrdinaryExpensesBNK",
+            # 保険業
+            "jppfs_cor:OperatingIncomeINS",
+            "jppfs_cor:OperatingExpensesINS",
         ]
         operating_income_bnk_item = self._get_qname_item_recursively(
-            operating_income_item, operating_income_bnk_qnames
+            operating_income_item, operating_income_in_specific_domain_qname
         )
 
         if operating_income_bnk_item is None:
@@ -887,6 +1087,10 @@ class PLConcept(FinancialStatementConcept):
             pl_root_fact = self._get_unique_fact_by_concept_and_context(
                 self.pl_root_concept, context
             )
+            if pl_root_fact is None:
+                raise ValueError(
+                    f"Profit and loss root fact should not be None. context: {context}, pl_root_concept: {self.pl_root_concept}"
+                )
             profit_and_loss_item = self._extract_items(self.pl_root_concept, context)
             if profit_and_loss_item is None:
                 raise ValueError(
@@ -895,6 +1099,7 @@ class PLConcept(FinancialStatementConcept):
 
             # 営業利益を起点とする
             operating_income_item = self._extract_operating_income(profit_and_loss_item)
+
             if operating_income_item is None:
                 raise ValueError(
                     f"Operating income item should not be None. context: {context}, pl_root_concept: {self.pl_root_concept}"
@@ -905,6 +1110,7 @@ class PLConcept(FinancialStatementConcept):
             )
 
             instance = PLInstance(
+                accountStandard=self.account_standard,
                 operatingIncome=operating_income_item,
                 expenses=expenses,
                 netSales=net_sales,
@@ -914,13 +1120,21 @@ class PLConcept(FinancialStatementConcept):
                 durationTo=context.endDatetime,
                 unit=pl_root_fact.unitID,
                 roleType=self.role_type,
+                docId=self.docId,
+                docType=self.docType,
+                docSubmissionDate=self.docSubmissionDate,
             )
             instances.append(instance)
 
         return instances
 
 
-def _get_pl_jp_concepts(model_xbrl: ModelXbrl) -> list[PLConcept]:
+def _get_pl_jp_concepts(
+    model_xbrl: ModelXbrl,
+    doc_id: str,
+    doc_type: Literal["Annual", "Quarterly", "SemiAnnual"],
+    doc_submission_date: datetime,
+) -> list[PLConcept]:
     """
     JP GAAP の非連結損益計算書のConceptを取得する
     """
@@ -928,25 +1142,51 @@ def _get_pl_jp_concepts(model_xbrl: ModelXbrl) -> list[PLConcept]:
     pl_concepts: list[PLConcept] = []
     for root_concepts, role_type, summation_item in pl_jp_concepts:
         pl_concept = PLConcept(
-            root_concepts, role_type, summation_item, "JP GAAP", False
+            root_concepts,
+            role_type,
+            summation_item,
+            "JP GAAP",
+            False,
+            doc_id=doc_id,
+            doc_type=doc_type,
+            doc_submission_date=doc_submission_date,
         )
         pl_concepts.append(pl_concept)
     return pl_concepts
 
 
-def _get_pl_ifrs_concepts(model_xbrl: ModelXbrl) -> list[PLConcept]:
+def _get_pl_ifrs_concepts(
+    model_xbrl: ModelXbrl,
+    doc_id: str,
+    doc_type: Literal["Annual", "Quarterly", "SemiAnnual"],
+    doc_submission_date: datetime,
+) -> list[PLConcept]:
     """
     IFRS の非連結損益計算書のConceptを取得する
     """
     pl_ifrs_concepts = _get_financial_statement_concepts(model_xbrl, PL_ROLE_TYPE_IFRS)
     pl_concepts: list[PLConcept] = []
     for root_concepts, role_type, summation_item in pl_ifrs_concepts:
-        pl_concept = PLConcept(root_concepts, role_type, summation_item, "IFRS", False)
+        pl_concept = PLConcept(
+            root_concepts,
+            role_type,
+            summation_item,
+            "IFRS",
+            False,
+            doc_id=doc_id,
+            doc_type=doc_type,
+            doc_submission_date=doc_submission_date,
+        )
         pl_concepts.append(pl_concept)
     return pl_concepts
 
 
-def _get_pl_consolidated_jp_concepts(model_xbrl: ModelXbrl) -> list[PLConcept]:
+def _get_pl_consolidated_jp_concepts(
+    model_xbrl: ModelXbrl,
+    doc_id: str,
+    doc_type: Literal["Annual", "Quarterly", "SemiAnnual"],
+    doc_submission_date: datetime,
+) -> list[PLConcept]:
     """
     JP GAAP の連結損益計算書のConceptを取得する
     """
@@ -956,13 +1196,25 @@ def _get_pl_consolidated_jp_concepts(model_xbrl: ModelXbrl) -> list[PLConcept]:
     pl_concepts: list[PLConcept] = []
     for root_concepts, role_type, summation_item in pl_consolidated_jp_concepts:
         pl_concept = PLConcept(
-            root_concepts, role_type, summation_item, "JP GAAP", True
+            root_concepts,
+            role_type,
+            summation_item,
+            "JP GAAP",
+            True,
+            doc_id=doc_id,
+            doc_type=doc_type,
+            doc_submission_date=doc_submission_date,
         )
         pl_concepts.append(pl_concept)
     return pl_concepts
 
 
-def _get_pl_consolidated_ifrs_concepts(model_xbrl: ModelXbrl) -> list[PLConcept]:
+def _get_pl_consolidated_ifrs_concepts(
+    model_xbrl: ModelXbrl,
+    doc_id: str,
+    doc_type: Literal["Annual", "Quarterly", "SemiAnnual"],
+    doc_submission_date: datetime,
+) -> list[PLConcept]:
     """
     IFRS の連結損益計算書のConceptを取得する
     """
@@ -971,19 +1223,39 @@ def _get_pl_consolidated_ifrs_concepts(model_xbrl: ModelXbrl) -> list[PLConcept]
     )
     pl_concepts: list[PLConcept] = []
     for root_concepts, role_type, summation_item in pl_consolidated_ifrs_concepts:
-        pl_concept = PLConcept(root_concepts, role_type, summation_item, "IFRS", True)
+        pl_concept = PLConcept(
+            root_concepts,
+            role_type,
+            summation_item,
+            "IFRS",
+            True,
+            doc_id=doc_id,
+            doc_type=doc_type,
+            doc_submission_date=doc_submission_date,
+        )
         pl_concepts.append(pl_concept)
     return pl_concepts
 
 
-def get_pl_concepts(model_xbrl: ModelXbrl) -> list[PLConcept]:
+def get_pl_concepts(
+    model_xbrl: ModelXbrl, doc_id: str, doc_type: str, doc_submission_date: datetime
+) -> list[PLConcept]:
     """
     損益計算書のConceptを取得する
     """
-    pl_jp_concepts = _get_pl_jp_concepts(model_xbrl)
-    pl_ifrs_concepts = _get_pl_ifrs_concepts(model_xbrl)
-    pl_consolidated_jp_concepts = _get_pl_consolidated_jp_concepts(model_xbrl)
-    pl_consolidated_ifrs_concepts = _get_pl_consolidated_ifrs_concepts(model_xbrl)
+    logger.debug("Get PL concepts")
+    pl_jp_concepts = _get_pl_jp_concepts(
+        model_xbrl, doc_id, doc_type, doc_submission_date
+    )
+    pl_ifrs_concepts = _get_pl_ifrs_concepts(
+        model_xbrl, doc_id, doc_type, doc_submission_date
+    )
+    pl_consolidated_jp_concepts = _get_pl_consolidated_jp_concepts(
+        model_xbrl, doc_id, doc_type, doc_submission_date
+    )
+    pl_consolidated_ifrs_concepts = _get_pl_consolidated_ifrs_concepts(
+        model_xbrl, doc_id, doc_type, doc_submission_date
+    )
     pl_concepts = (
         pl_jp_concepts
         + pl_ifrs_concepts
@@ -994,6 +1266,7 @@ def get_pl_concepts(model_xbrl: ModelXbrl) -> list[PLConcept]:
 
 
 class CFInstance(BaseModel):
+    accountStandard: str
     operating: AccountingItem
     investing: AccountingItem
     financing: AccountingItem
@@ -1002,6 +1275,9 @@ class CFInstance(BaseModel):
     durationTo: datetime
     unit: str
     roleType: str
+    docId: str
+    docType: Literal["Annual", "Quarterly", "SemiAnnual"]
+    docSubmissionDate: datetime
 
 
 class CFConcept(FinancialStatementConcept):
@@ -1012,54 +1288,76 @@ class CFConcept(FinancialStatementConcept):
         summation_item: str,
         account_standard: str,
         consolidated: bool,
+        doc_id: str,
+        doc_type: Literal["Annual", "SemiAnnual", "Quarterly"],
+        doc_submission_date: datetime,
     ):
         super().__init__(
-            root_concepts, role_type, summation_item, account_standard, consolidated
+            root_concepts,
+            role_type,
+            summation_item,
+            account_standard,
+            consolidated,
+            doc_id,
+            doc_type,
+            doc_submission_date,
         )
 
-        if len(root_concepts) != 1:
+        cf_root_concept_qnames = [
+            "jppfs_cor:NetIncreaseDecreaseInCashAndCashEquivalents",
+            "jpigp_cor:NetIncreaseDecreaseInCashAndCashEquivalentsIFRS",
+            # 大塚ホールディングス株式会社第15期有価証券報告書の項目
+            "jpigp_cor:NetIncreaseDecreaseInCashAndCashEquivalentsBeforeEffectOfExchangeRateChangesIFRS",  # 現金及び現金同等物の増減額（△は減少）（換算差額加算前）（IFRS）
+        ]
+        self.root_concepts = [
+            concept
+            for concept in root_concepts
+            if str(concept.qname) in cf_root_concept_qnames
+        ]
+
+        if len(self.root_concepts) != 1:
             raise ValueError(
                 f"Root concept should have at least 1 concept, but got {len(root_concepts)}, root_concepts: {root_concepts}"
             )
-        main_concepts_and_relationship = self._get_child_concepts(root_concepts[0])
+        main_concepts_and_relationship = self._get_child_concepts(self.root_concepts[0])
         main_concepts = [concept for concept, _ in main_concepts_and_relationship]
 
         # オリックス銀行株式会社第32期半期決算書には、財務活動キャッシュフローがない
         # キャッシュフローは必ずしも三つが全て揃っているわけではないため、None を許容する
-        root_operating_concept: ModelConcept | None = (
+        root_operating_concept: Optional[ModelConcept] = (
             self.search_unique_concept_by_label(
                 main_concepts, ["営業活動", "operating"]
             )
         )
-        root_investing_concept: ModelConcept | None = (
+        root_investing_concept: Optional[ModelConcept] = (
             self.search_unique_concept_by_label(
                 main_concepts, ["投資活動", "investing"]
             )
         )
-        root_financing_concept: ModelConcept | None = (
+        root_financing_concept: Optional[ModelConcept] = (
             self.search_unique_concept_by_label(
                 main_concepts, ["財務活動", "financing"]
             )
         )
 
         if root_operating_concept is None:
-            print(
+            logger.warning(
                 f"[WARNING] Operating concept is not found. main_concepts: {main_concepts}"
             )
 
         if root_investing_concept is None:
-            print(
+            logger.warning(
                 f"[WARNING] Investing concept is not found. main_concepts: {main_concepts}"
             )
 
         if root_financing_concept is None:
-            print(
+            logger.warning(
                 f"[WARNING] Financing concept is not found. main_concepts: {main_concepts}"
             )
 
-        self.root_operating_concept: ModelConcept | None = root_operating_concept
-        self.root_investing_concept: ModelConcept | None = root_investing_concept
-        self.root_financing_concept: ModelConcept | None = root_financing_concept
+        self.root_operating_concept: Optional[ModelConcept] = root_operating_concept
+        self.root_investing_concept: Optional[ModelConcept] = root_investing_concept
+        self.root_financing_concept: Optional[ModelConcept] = root_financing_concept
 
     def extract_instances(self) -> list[CFInstance]:
         """
@@ -1113,10 +1411,15 @@ class CFConcept(FinancialStatementConcept):
             operating_root_fact = self._get_unique_fact_by_concept_and_context(
                 self.root_operating_concept, context
             )
+            if operating_root_fact is None:
+                raise ValueError(
+                    f"Operating root fact is not found. context: {context}, concept: {self.root_operating_concept}"
+                )
             duration_from = context.startDatetime
             duration_to = context.endDatetime
 
             instance = CFInstance(
+                accountStandard=self.account_standard,
                 operating=operating_item,
                 investing=investing_item,
                 financing=financing_item,
@@ -1125,13 +1428,21 @@ class CFConcept(FinancialStatementConcept):
                 durationTo=duration_to,
                 unit=operating_root_fact.unitID,
                 roleType=self.role_type,
+                docId=self.docId,
+                docType=self.docType,
+                docSubmissionDate=self.docSubmissionDate,
             )
             instances.append(instance)
 
         return instances
 
 
-def _get_cf_jp_concepts(model_xbrl: ModelXbrl) -> list[CFConcept]:
+def _get_cf_jp_concepts(
+    model_xbrl: ModelXbrl,
+    doc_id: str,
+    doc_type: Literal["Annual", "Quarterly", "SemiAnnual"],
+    doc_submission_date: datetime,
+) -> list[CFConcept]:
     """
     JP GAAP の非連結キャッシュフロー計算書のConceptを取得する
     """
@@ -1139,25 +1450,51 @@ def _get_cf_jp_concepts(model_xbrl: ModelXbrl) -> list[CFConcept]:
     cf_concepts: list[CFConcept] = []
     for root_concepts, role_type, summation_item in cf_jp_concepts:
         cf_concept = CFConcept(
-            root_concepts, role_type, summation_item, "JP GAAP", False
+            root_concepts,
+            role_type,
+            summation_item,
+            "JP GAAP",
+            False,
+            doc_id=doc_id,
+            doc_type=doc_type,
+            doc_submission_date=doc_submission_date,
         )
         cf_concepts.append(cf_concept)
     return cf_concepts
 
 
-def _get_cf_ifrs_concepts(model_xbrl: ModelXbrl) -> list[CFConcept]:
+def _get_cf_ifrs_concepts(
+    model_xbrl: ModelXbrl,
+    doc_id: str,
+    doc_type: Literal["Annual", "Quarterly", "SemiAnnual"],
+    doc_submission_date: datetime,
+) -> list[CFConcept]:
     """
     IFRS の非連結キャッシュフロー計算書のConceptを取得する
     """
     cf_ifrs_concepts = _get_financial_statement_concepts(model_xbrl, CF_ROLE_TYPE_IFRS)
     cf_concepts: list[CFConcept] = []
     for root_concepts, role_type, summation_item in cf_ifrs_concepts:
-        cf_concept = CFConcept(root_concepts, role_type, summation_item, "IFRS", False)
+        cf_concept = CFConcept(
+            root_concepts,
+            role_type,
+            summation_item,
+            "IFRS",
+            False,
+            doc_id=doc_id,
+            doc_type=doc_type,
+            doc_submission_date=doc_submission_date,
+        )
         cf_concepts.append(cf_concept)
     return cf_concepts
 
 
-def _get_cf_consolidated_jp_concepts(model_xbrl: ModelXbrl) -> list[CFConcept]:
+def _get_cf_consolidated_jp_concepts(
+    model_xbrl: ModelXbrl,
+    doc_id: str,
+    doc_type: Literal["Annual", "Quarterly", "SemiAnnual"],
+    doc_submission_date: datetime,
+) -> list[CFConcept]:
     """
     JP GAAP の連結キャッシュフロー計算書のConceptを取得する
     """
@@ -1167,13 +1504,25 @@ def _get_cf_consolidated_jp_concepts(model_xbrl: ModelXbrl) -> list[CFConcept]:
     cf_concepts: list[CFConcept] = []
     for root_concepts, role_type, summation_item in cf_consolidated_jp_concepts:
         cf_concept = CFConcept(
-            root_concepts, role_type, summation_item, "JP GAAP", True
+            root_concepts,
+            role_type,
+            summation_item,
+            "JP GAAP",
+            True,
+            doc_id=doc_id,
+            doc_type=doc_type,
+            doc_submission_date=doc_submission_date,
         )
         cf_concepts.append(cf_concept)
     return cf_concepts
 
 
-def _get_cf_consolidated_ifrs_concepts(model_xbrl: ModelXbrl) -> list[CFConcept]:
+def _get_cf_consolidated_ifrs_concepts(
+    model_xbrl: ModelXbrl,
+    doc_id: str,
+    doc_type: Literal["Annual", "Quarterly", "SemiAnnual"],
+    doc_submission_date: datetime,
+) -> list[CFConcept]:
     """
     IFRS の連結キャッシュフロー計算書のConceptを取得する
     """
@@ -1182,19 +1531,39 @@ def _get_cf_consolidated_ifrs_concepts(model_xbrl: ModelXbrl) -> list[CFConcept]
     )
     cf_concepts: list[CFConcept] = []
     for root_concepts, role_type, summation_item in cf_consolidated_ifrs_concepts:
-        cf_concept = CFConcept(root_concepts, role_type, summation_item, "IFRS", True)
+        cf_concept = CFConcept(
+            root_concepts,
+            role_type,
+            summation_item,
+            "IFRS",
+            True,
+            doc_id=doc_id,
+            doc_type=doc_type,
+            doc_submission_date=doc_submission_date,
+        )
         cf_concepts.append(cf_concept)
     return cf_concepts
 
 
-def get_cf_concepts(model_xbrl: ModelXbrl) -> list[CFConcept]:
+def get_cf_concepts(
+    model_xbrl: ModelXbrl, doc_id: str, doc_type: str, doc_submission_date: datetime
+) -> list[CFConcept]:
     """
     キャッシュフロー計算書のConceptを取得する
     """
-    cf_jp_concepts = _get_cf_jp_concepts(model_xbrl)
-    cf_ifrs_concepts = _get_cf_ifrs_concepts(model_xbrl)
-    cf_consolidated_jp_concepts = _get_cf_consolidated_jp_concepts(model_xbrl)
-    cf_consolidated_ifrs_concepts = _get_cf_consolidated_ifrs_concepts(model_xbrl)
+    logger.debug("Get CF concepts")
+    cf_jp_concepts = _get_cf_jp_concepts(
+        model_xbrl, doc_id, doc_type, doc_submission_date
+    )
+    cf_ifrs_concepts = _get_cf_ifrs_concepts(
+        model_xbrl, doc_id, doc_type, doc_submission_date
+    )
+    cf_consolidated_jp_concepts = _get_cf_consolidated_jp_concepts(
+        model_xbrl, doc_id, doc_type, doc_submission_date
+    )
+    cf_consolidated_ifrs_concepts = _get_cf_consolidated_ifrs_concepts(
+        model_xbrl, doc_id, doc_type, doc_submission_date
+    )
     cf_concepts = (
         cf_jp_concepts
         + cf_ifrs_concepts

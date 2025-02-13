@@ -2,6 +2,7 @@ json-data/
 xbrl-files/
 old-xbrl-files/
 old-json-data/
+json-data-v2/
 .venv/
 __pycache__/
 

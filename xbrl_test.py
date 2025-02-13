@@ -12,9 +12,7 @@ from xbrl_utils import (
 )
 
 XBRL_ARCHIVE_FILES = Path("xbrl-files").glob("**/*_xbrl.zip")
-XBRL_ARCHIVE_FILES = list(
-    islice(XBRL_ARCHIVE_FILES, 155 + 61 + 223 + 208 + 353, 100000)
-)
+XBRL_ARCHIVE_FILES = list(islice(XBRL_ARCHIVE_FILES, 10))
 
 
 total_file_count = len(XBRL_ARCHIVE_FILES)

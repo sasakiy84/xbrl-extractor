@@ -1,5 +1,5 @@
+// deno --allow-net --allow-write --env-file .env test.ts
 import type { DocumentMetadata, ListResponse } from "./types.ts";
-// import path lib
 import { join } from "jsr:@std/path";
 
 const EDINET_ENDPOINT_V2 = Deno.env.get("EDINET_ENDPOINT_V2");
