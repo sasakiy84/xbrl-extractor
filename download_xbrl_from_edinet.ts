@@ -5,6 +5,11 @@ import { join } from "jsr:@std/path";
 const EDINET_ENDPOINT_V2 = Deno.env.get("EDINET_ENDPOINT_V2");
 const API_KEY = Deno.env.get("EDINET_API_KEY");
 
+const DATE_RANGE = {
+	from: new Date("2022-01-01"),
+	to: new Date("2024-12-31"),
+};
+
 if (EDINET_ENDPOINT_V2 === undefined) {
 	throw new Error("EDINET_ENDPOINT_V2 is not set");
 }
@@ -93,10 +98,6 @@ const downloadCSV = async (documentId: string, resultPath: string) => {
 };
 
 const results: DocumentMetadata[] = [];
-const DATE_RANGE = {
-	from: new Date("2022-01-01"),
-	to: new Date("2024-12-31"),
-};
 
 for (
 	const date = DATE_RANGE.from;
