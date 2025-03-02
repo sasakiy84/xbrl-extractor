@@ -32,6 +32,7 @@ from concurrent.futures import ProcessPoolExecutor
 
 RESULT_ROOT_DIR = Path("json-data-v2")
 RESULT_ROOT_DIR.mkdir(exist_ok=True)
+LIMIT: int | None = None
 
 
 def construct_result_file_path(company_folder: Path) -> Path:
@@ -83,7 +84,9 @@ XBRL_ARCHIVE_FILES = list(filter(lambda x: x.is_dir(), Path("xbrl-files").glob("
 XBRL_ARCHIVE_FILES = list(
     filterfalse(lambda x: construct_result_file_path(x).exists(), XBRL_ARCHIVE_FILES)
 )
-# XBRL_ARCHIVE_FILES = list(islice(XBRL_ARCHIVE_FILES, 200))
+XBRL_ARCHIVE_FILES = (
+    list(islice(XBRL_ARCHIVE_FILES, LIMIT)) if LIMIT else XBRL_ARCHIVE_FILES
+)
 
 
 class FinancialStatementDocument(BaseModel):
